@@ -1,0 +1,185 @@
+PROYECTO MAKAIA
+Modelo de Integración y Cruce de Datos
+Cómo llega cada fuente y cómo se relacionan entre sí
+Caso EPM / Antioquia — energía eléctrica
+Versión 1.0 · 17 de agosto de 2026
+Contenido
+1.  Propósito3
+2.  El principio: dimensiones conformes y granularidad3
+3.  Cómo llega cada fuente (forma nativa)3
+4.  Las dos espinas: Geografía (DIVIPOLA) y Tiempo4
+5.  La regla de oro de la granularidad4
+6.  El modelo de cruce (esquema estrella)5
+7.  Los cuatro tipos de cruce6
+8.  Caso completo: clima → incidentes7
+9.  Reconciliar granularidad: agregar vs. difundir8
+10.  Checklist de integración9
+1. Propósito
+Este documento no vuelve a listar las fuentes (eso ya está en el documento de origen de datos). Aquí resolvemos la pregunta que sigue: cómo llega cada fuente en su forma nativa y, sobre todo, cómo relacionarlas correctamente entre sí. Es el núcleo del proyecto, porque el valor no está en tener los datos, sino en cruzarlos bien.
+La idea central es simple de enunciar y exigente de aplicar: cada fuente vive en su propia granularidad (su nivel de detalle en espacio y en tiempo), y dos datos solo se pueden relacionar en la granularidad que comparten. Todo el diseño gira en torno a hacer explícita esa granularidad y a construir dos “espinas” comunes —una de geografía y otra de tiempo— a las que todo se engancha.
+2. El principio: dimensiones conformes y granularidad
+Granularidad (o “grano”): es el nivel de detalle de una fila. El grano del consumo es “un cliente en una hora”; el de un incidente es “un evento en un punto”; el de SUI es “un municipio en un mes”. Antes de cruzar dos tablas hay que saber el grano de cada una, porque determina qué join es correcto y cuál produce números inflados o sin sentido.
+Dimensión conforme: es una tabla de referencia compartida por todas las demás, con las mismas llaves y los mismos valores en todo el modelo. En este proyecto hay dos: la geografía (con el código DIVIPOLA como llave) y el tiempo (con la fecha/hora). Que sean “conformes” significa que un municipio o una hora se identifican igual en consumo, en incidentes, en clima y en SUI. Esa es la condición que hace posible el cruce.
+La consecuencia práctica
+Nunca se cruzan dos fuentes “directamente” por nombre de municipio o por coincidencia aproximada. Se cruzan porque ambas apuntan a la misma fila de una dimensión conforme: el mismo cod_divipola, la misma hora. Construir y mantener esas dos dimensiones es el 80% del trabajo de integración.
+3. Cómo llega cada fuente (forma nativa)
+Para relacionar bien, primero hay que saber en qué forma llega cada fuente: su grano, su llave natural y su formato. Esta tabla es el punto de partida del cruce.
+Fuente
+Forma en que llega
+Grano nativo
+Llave natural
+Formato
+Open-Meteo
+Serie por coordenada consultada
+Punto × hora
+lat/long + timestamp
+JSON (API)
+OpenStreetMap
+Capas vectoriales (polígonos/líneas)
+Geometría
+geometría (geom)
+GeoJSON / PBF
+SUI
+Reportes tabulares certificados
+Empresa-municipio × mes/año
+empresa + municipio + periodo
+CSV / descarga
+DANE
+Tablas censales y proyecciones
+Municipio (o manzana) × año
+cod_divipola + año
+CSV / dataset
+EPM Datos Abiertos
+Datasets (tarifas, interrupciones)
+Municipio/circuito × periodo
+municipio + periodo
+CSV (CKAN)
+Interno — consumo
+Filas generadas por el simulador
+Cliente × hora
+cliente_id + fecha/hora
+tabla SQL
+Interno — incidentes
+Filas generadas por el simulador
+Evento (activo)
+infraestructura_id + timestamp
+tabla SQL
+Interno — infraestructura
+Filas generadas (ubicadas en OSM)
+Activo
+infraestructura_id + lat/long
+tabla SQL
+Dos observaciones que evitan errores
+1. Open-Meteo llega por coordenada, no por municipio: se consulta un punto representativo por zona/municipio (por ejemplo, la cabecera) y esa serie se asigna a esa zona. Así el clima adquiere una llave geográfica (cod_divipola) que antes no tenía.
+2. Los nombres de municipio NO sirven como llave: “Itagüí”, “El Carmen de Viboral” o “San Andrés de Cuerquia” se escriben distinto entre EPM, SUI, DANE y OSM (tildes, artículos, mayúsculas). La llave siempre es el código DIVIPOLA del DANE.
+4. Las dos espinas: Geografía (DIVIPOLA) y Tiempo
+4.1 Geografía canónica
+Es una tabla dimensión que contiene la jerarquía territorial de Antioquia y, para cada nivel, su código DIVIPOLA y su geometría (polígono) tomada de OpenStreetMap. Antioquia es el departamento 05; cada municipio tiene su código de cinco dígitos. Todos los demás datos se enganchan a esta tabla por cod_divipola o por zona_id.
+Nivel
+Ejemplo
+Llave
+Departamento
+Antioquia
+05
+Subregión
+Valle de Aburrá, Oriente, Urabá…
+(9 subregiones)
+Municipio
+Medellín, Bello, Rionegro, Caucasia…
+cod_divipola (5 dígitos)
+Zona / comuna / barrio
+Comuna, barrio, sector
+zona_id
+Punto
+Coordenada de un activo o incidente
+lat/long → zona vía PostGIS
+4.2 Tiempo
+Una dimensión de tiempo con fecha y hora, y sus derivados (día, mes, periodo de facturación, festivo). Permite alinear series de distinto grano: el consumo horario se agrega a mes para cruzarse con la facturación o con SUI; el timestamp de un incidente se trunca a la hora para cruzarse con el clima.
+5. La regla de oro de la granularidad
+Visualizar dónde vive cada fuente en el plano espacio–tiempo aclara de inmediato qué se puede cruzar y qué hay que reconciliar. Cada punto es una fuente; los ejes son su resolución espacial y temporal.
+Figura 1. Mapa de granularidad. Dos fuentes solo se cruzan directamente si coinciden en un eje; si no, hay que mover la más fina hacia el grano de la más gruesa.
+Cómo se lee
+El consumo (cliente·horario) y el clima (municipio·horario) comparten el eje temporal pero no el espacial: para relacionarlos se agrega el consumo a municipio·hora. El clima y los incidentes se encuentran llevando el incidente a (municipio, hora). SUI y DANE viven arriba a la derecha (grueso): sirven para calibrar y dar contexto, nunca para unirse fila a fila con un cliente o un activo.
+6. El modelo de cruce (esquema estrella)
+El almacén se organiza como un esquema estrella: en el centro, las dos dimensiones conformes (geografía y tiempo); alrededor, las tablas de hechos (consumo, facturación, incidentes, mantenimiento) y las dimensiones de entidad (cliente, infraestructura). El clima es un sujeto que se engancha a geografía y tiempo. Los agregados externos (SUI, DANE) quedan en una capa aparte que se conecta solo al nivel municipio·periodo.
+Figura 2. Modelo de cruce. Toda tabla de hechos se relaciona con la geografía por zona_id y con el tiempo por fecha/hora; las entidades aportan cliente_id e infraestructura_id; PostGIS asigna la zona a cada punto.
+7. Los cuatro tipos de cruce
+En la práctica solo hay cuatro maneras de relacionar la información, y conviene tenerlas nombradas.
+7.1 Interno ↔ interno (llaves de negocio)
+El más directo: se unen por las llaves primarias/foráneas del modelo. Consumo y facturación se unen a cliente por cliente_id; incidentes y mantenimiento se unen a infraestructura por infraestructura_id. Aquí no hay ambigüedad de grano porque las llaves son exactas.
+-- Consumo mensual por cliente, con su estrato
+SELECT c.cliente_id, c.estrato,
+date_trunc('month', cn.fecha) AS mes,
+SUM(cn.consumo_kwh)           AS kwh_mes
+FROM   consumo cn
+JOIN   clientes c USING (cliente_id)
+GROUP  BY c.cliente_id, c.estrato, mes;
+7.2 Cruce espacial (PostGIS)
+Cuando un dato trae coordenada pero no zona (un activo, un incidente), PostGIS asigna la zona/municipio con una operación de punto-en-polígono contra la geometría de la dimensión geográfica. Esto se corre una vez al cargar y deja cada punto ya “geocodificado” a la espina.
+-- Asignar el municipio (DIVIPOLA) a cada activo por su coordenada
+UPDATE infraestructura i
+SET    cod_divipola = g.cod_divipola,
+zona_id      = g.zona_id
+FROM   dim_geografia g
+WHERE  ST_Contains(g.geom,
+ST_SetSRID(ST_MakePoint(i.longitud, i.latitud), 4326));
+7.3 Cruce temporal (alinear el grano de tiempo)
+Dos series con distinta frecuencia se alinean truncando o agregando el tiempo al grano común: el timestamp del incidente se trunca a la hora para encontrarse con el clima horario; el consumo horario se suma a mes para encontrarse con la facturación o con SUI.
+-- Llevar el incidente a la hora, para cruzarlo con clima horario
+SELECT inc.incidente_id,
+date_trunc('hour', inc.ts) AS hora
+FROM   incidentes inc;
+7.4 Agregados externos (calibración y contexto)
+SUI y DANE no se unen a filas individuales: viven en municipio·periodo. Se usan de dos formas. Como calibración: se comprueba que la suma del dato simulado cuadre con el total real (por ejemplo, que el consumo simulado del municipio en el mes se acerque al reportado en SUI). Como contexto: se muestran junto a los KPIs (población, número de suscriptores, SAIDI/SAIFI) al nivel municipio.
+-- Calibración: consumo simulado vs. total real de SUI (municipio × mes)
+SELECT c.cod_divipola, f.periodo,
+SUM(cn.consumo_kwh) AS consumo_sim,
+s.consumo_total_kwh AS consumo_sui
+FROM   consumo cn
+JOIN   clientes    c USING (cliente_id)
+JOIN   facturacion f USING (cliente_id)
+JOIN   sui_consumo s ON s.cod_divipola = c.cod_divipola
+AND s.periodo      = f.periodo
+GROUP  BY c.cod_divipola, f.periodo, s.consumo_total_kwh;
+8. Caso completo: clima → incidentes
+Es la relación estrella del proyecto (¿el clima explica las fallas?) y ejercita tres de los cuatro cruces a la vez. El recorrido es:
+Cruce espacial: cada activo ya tiene cod_divipola asignado por PostGIS (paso 7.2), así que cada incidente hereda el municipio de su infraestructura.
+Cruce temporal: se trunca la hora del incidente para alinearla con la serie horaria del clima de ese municipio.
+Unión final: incidente ⋈ infraestructura ⋈ clima por (cod_divipola, fecha, hora).
+Une los tres: llave de negocio (infraestructura_id), geografía (cod_divipola) y tiempo (hora).
+-- Cada incidente con la condición climática de su municipio y hora
+SELECT inc.incidente_id, inc.tipo_falla, inc.severidad,
+cl.lluvia_mm, cl.viento_kmh, cl.temp_c
+FROM   incidentes inc
+JOIN   infraestructura i ON i.infraestructura_id = inc.infraestructura_id
+JOIN   clima cl ON cl.cod_divipola = i.cod_divipola
+AND cl.fecha        = inc.fecha
+AND cl.hora         = date_trunc('hour', inc.ts);
+Para medir la relación (no solo listarla) se sube al grano que ambos comparten —municipio × día— y se compara la tasa de incidentes con la lluvia acumulada:
+-- ¿Más lluvia, más fallas? Al grano compartido: municipio × día
+SELECT i.cod_divipola, inc.fecha,
+COUNT(*)          AS incidentes,
+SUM(cl.lluvia_mm) AS lluvia_dia
+FROM   incidentes inc
+JOIN   infraestructura i USING (infraestructura_id)
+JOIN   clima cl ON cl.cod_divipola = i.cod_divipola
+AND cl.fecha        = inc.fecha
+GROUP  BY i.cod_divipola, inc.fecha;
+Por qué importa el grano aquí
+Si se cruzara el clima horario del municipio con cada incidente sin agregar, un día con 40 incidentes en Medellín contaría 40 veces la misma lluvia y el análisis quedaría sesgado. Subir ambos a municipio·día hace la comparación correcta y es exactamente lo que el simulador debe reproducir (más lluvia → más fallas).
+9. Reconciliar granularidad: agregar vs. difundir
+Cuando dos fuentes no comparten grano, hay solo dos movimientos válidos, y uno prohibido.
+Agregar hacia arriba (siempre válido): llevar la fuente fina al grano de la gruesa sumando o promediando (consumo horario → mensual; incidentes por activo → por municipio). Es como se compara con SUI/DANE y como se relacionan clima e incidentes.
+Difundir hacia abajo como contexto (válido con cuidado): adjuntar un valor grueso a filas finas solo como atributo de contexto, sin inventar detalle (a cada cliente de un municipio se le puede anexar la población o el estrato del municipio para segmentar, sabiendo que es un dato del municipio, no del cliente).
+Fabricar detalle (prohibido): repartir un total municipal entre clientes individuales como si fuera una medición real. Eso inventa datos que no existen y contamina cualquier análisis o modelo posterior.
+Regla mínima
+Agregar la fina hacia la gruesa: sí. Difundir la gruesa como contexto etiquetado: sí. Inventar detalle fino a partir de un agregado: nunca.
+10. Checklist de integración
+Construir la dimensión geografía con DIVIPOLA + geometría de OSM (Antioquia = 05).
+Construir la dimensión tiempo (fecha, hora, mes, periodo, festivos).
+Geocodificar con PostGIS cada activo e incidente: coordenada → zona_id / cod_divipola.
+Asignar a cada zona/municipio su punto de clima de Open-Meteo (serie horaria).
+Denormalizar cod_divipola en consumo e incidentes para acelerar BI y mapas.
+Definir el grano de cada tabla de hechos y documentarlo junto a la tabla.
+Calibrar los volúmenes simulados contra SUI (consumo, suscriptores) y la frecuencia/duración de incidentes contra SAIDI/SAIFI.
+Cruzar siempre por llave (cod_divipola, fecha/hora, cliente_id, infraestructura_id), nunca por nombre de municipio.
